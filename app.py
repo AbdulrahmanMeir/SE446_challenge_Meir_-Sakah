@@ -1,137 +1,227 @@
 """Streamlit dashboard for News Pulse."""
 
+import os
+import time
+from pathlib import Path
+
+import pandas as pd
 import streamlit as st
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from streamlit import st_autorefresh
 
 from llm_summary import generate_summary
 
-st.set_page_config(page_title="News Pulse - Live", layout="wide")
-st.title("News Pulse - Live")
-st.markdown("Live Spark streaming counts from incoming RSS headlines.")
 
-st_autorefresh(interval=7000, key="news_pulse_refresh")
+# Windows Hadoop fix
+os.environ["HADOOP_HOME"] = r"C:\hadoop"
+os.environ["PATH"] = r"C:\hadoop\bin;" + os.environ.get("PATH", "")
 
-spark = (
-    SparkSession.builder
-    .appName("NewsPulseApp")
-    .master("local[1]")
-    .getOrCreate()
-)
-spark.sparkContext.setLogLevel("ERROR")
+BASE_DIR = Path(__file__).resolve().parent
+INCOMING_PATH = BASE_DIR / "data" / "incoming"
+INCOMING_PATH.mkdir(parents=True, exist_ok=True)
 
-schema = "source STRING, title STRING, url STRING, ts TIMESTAMP"
-stream = spark.readStream.schema(schema).json("data/incoming")
+SPARK_INCOMING_PATH = INCOMING_PATH.as_uri()
 
 STOP_WORDS = [
     "the", "and", "for", "with", "from", "that", "this", "have",
     "will", "their", "about", "which", "news", "your", "more",
+    "you", "are", "was", "were", "has", "had", "been", "into",
+    "after", "over", "under", "than", "they", "them", "his",
+    "her", "its", "our", "out", "not", "but", "who", "what",
+    "when", "where", "why", "how", "said", "says"
 ]
 
 
-def start_queries():
-    if st.session_state.get("queries_started"):
-        return
+@st.cache_resource
+def start_spark_stream():
+    """Start one Spark Structured Streaming query into a memory table."""
 
-    by_source = stream.groupBy("source").count()
-    query_by_source = (
-        by_source.writeStream
-        .outputMode("complete")
+    spark = (
+        SparkSession.builder
+        .appName("NewsPulseApp")
+        .master("local[*]")
+        .getOrCreate()
+    )
+
+    spark.sparkContext.setLogLevel("ERROR")
+
+    # Stop old query if Streamlit was restarted
+    for query in spark.streams.active:
+        if query.name == "news_raw":
+            query.stop()
+
+    schema = "source STRING, title STRING, url STRING, ts TIMESTAMP"
+
+    stream = (
+        spark.readStream
+        .schema(schema)
+        .option("maxFilesPerTrigger", 1)
+        .json(SPARK_INCOMING_PATH)
+    )
+
+    query = (
+        stream.writeStream
+        .outputMode("append")
         .format("memory")
-        .queryName("by_source")
-        .trigger(processingTime="10 seconds")
+        .queryName("news_raw")
+        .trigger(processingTime="5 seconds")
         .start()
     )
 
-    by_window = (
-        stream.withWatermark("ts", "2 hours")
-        .groupBy(F.window("ts", "1 hour"))
-        .count()
-    )
-    query_by_window = (
-        by_window.writeStream
-        .outputMode("complete")
-        .format("memory")
-        .queryName("by_window")
-        .trigger(processingTime="10 seconds")
-        .start()
+    return spark, query
+
+
+def safe_sql_to_pandas(spark, query):
+    """Run Spark SQL safely."""
+    try:
+        return spark.sql(query).toPandas()
+    except Exception:
+        return pd.DataFrame()
+
+
+st.set_page_config(page_title="News Pulse - Live", layout="wide")
+
+st.title("News Pulse - Live Dashboard")
+st.markdown("RSS headlines → Spark Structured Streaming → LLM summary → Streamlit dashboard")
+
+st.caption(f"Reading files from: `{INCOMING_PATH}`")
+st.caption(f"Spark path: `{SPARK_INCOMING_PATH}`")
+
+spark, stream_query = start_spark_stream()
+
+status_box = st.empty()
+summary_box = st.empty()
+source_box = st.empty()
+words_box = st.empty()
+window_box = st.empty()
+debug_box = st.empty()
+
+last_keywords = None
+last_summary = "Waiting for summary..."
+
+while True:
+    if stream_query.exception() is not None:
+        status_box.error("Spark streaming query failed.")
+        debug_box.code(str(stream_query.exception()))
+        st.stop()
+
+    # Raw streamed records
+    raw_df = safe_sql_to_pandas(
+        spark,
+        """
+        SELECT source, title, url, ts
+        FROM news_raw
+        """
     )
 
-    normalized = F.lower(F.regexp_replace(F.col("title"), "[^a-z0-9\\s]", ""))
-    words = F.explode(F.split(normalized, "\\s+"))
-    top_words = (
-        stream.select(words.alias("word"))
+    if raw_df.empty:
+        files = list(INCOMING_PATH.glob("*"))
+        status_box.warning(
+            f"Waiting for Spark micro-batch... Files found: {len(files)}"
+        )
+
+        debug_box.code(
+            f"""
+Query: {stream_query.name}
+Active: {stream_query.isActive}
+Status: {stream_query.status}
+Recent progress count: {len(stream_query.recentProgress)}
+Files in incoming folder: {len(files)}
+"""
+        )
+
+        time.sleep(5)
+        continue
+
+    status_box.success(f"Live streaming data is running. Records loaded: {len(raw_df)}")
+    debug_box.empty()
+
+    # Source chart
+    by_source_pd = safe_sql_to_pandas(
+        spark,
+        """
+        SELECT source, COUNT(*) AS count
+        FROM news_raw
+        GROUP BY source
+        ORDER BY count DESC
+        """
+    )
+
+    # Window chart
+    by_window_pd = safe_sql_to_pandas(
+        spark,
+        """
+        SELECT 
+            window(ts, '1 hour').start AS start,
+            COUNT(*) AS count
+        FROM news_raw
+        GROUP BY window(ts, '1 hour')
+        ORDER BY start
+        """
+    )
+
+    # Top words from raw title table
+    titles_df = spark.sql("SELECT title FROM news_raw")
+
+    normalized = F.lower(
+        F.regexp_replace(F.col("title"), r"[^a-zA-Z0-9\s]", "")
+    )
+
+    words_spark_df = (
+        titles_df
+        .select(
+            F.explode(
+                F.split(normalized, r"\s+")
+            ).alias("word")
+        )
         .filter(F.length("word") > 3)
         .filter(~F.col("word").isin(STOP_WORDS))
         .groupBy("word")
         .count()
-    )
-    query_top_words = (
-        top_words.writeStream
-        .outputMode("complete")
-        .format("memory")
-        .queryName("top_words")
-        .trigger(processingTime="10 seconds")
-        .start()
+        .orderBy(F.desc("count"))
+        .limit(20)
     )
 
-    st.session_state["queries_started"] = True
-    st.session_state["query_names"] = ["by_source", "by_window", "top_words"]
+    top_words_pd = words_spark_df.toPandas()
 
+    # Summary
+    with summary_box.container():
+        st.markdown("### Live LLM Summary")
 
-def load_table(name):
-    if not spark.catalog.tableExists(name):
-        return None
-    return spark.sql(f"SELECT * FROM {name}")
+        if top_words_pd.empty:
+            st.info("Waiting for keywords...")
+        else:
+            keywords = top_words_pd["word"].head(15).tolist()
 
+            if keywords != last_keywords:
+                last_keywords = keywords
+                last_summary = generate_summary(keywords)
 
-start_queries()
+            st.info(last_summary)
 
-source_table = load_table("by_source")
-window_table = load_table("by_window")
-top_words_table = load_table("top_words")
+    col1, col2 = st.columns(2)
 
-if source_table is None or window_table is None or top_words_table is None:
-    st.info("Waiting for streaming data... Start the ingester and wait for the first batch.")
-    st.write("Run `python ingester.py` in one terminal and `python streaming_job.py` in another.")
-    st.stop()
+    with source_box.container():
+        with col1:
+            st.markdown("### Headlines by Source")
+            if by_source_pd.empty:
+                st.write("No source data yet.")
+            else:
+                st.bar_chart(by_source_pd.set_index("source")["count"])
 
-by_source_pd = source_table.orderBy(F.desc("count")).toPandas()
-by_window_pd = window_table.select("window.start", "window.end", "count").orderBy("start").toPandas()
-top_words_pd = top_words_table.orderBy(F.desc("count")).limit(20).toPandas()
+        with col2:
+            st.markdown("### Trending Headline Words")
+            if top_words_pd.empty:
+                st.write("No word data yet.")
+            else:
+                st.dataframe(top_words_pd, use_container_width=True)
 
-keywords = top_words_pd["word"].head(7).tolist()
-summary_key = tuple(keywords)
-if st.session_state.get("last_keywords") != summary_key:
-    st.session_state["last_keywords"] = summary_key
-    st.session_state["summary_text"] = generate_summary(keywords)
+    with window_box.container():
+        st.markdown("### Hourly Headline Volume")
+        if by_window_pd.empty:
+            st.write("No hourly volume data yet.")
+        else:
+            by_window_pd["start"] = by_window_pd["start"].astype(str)
+            st.line_chart(by_window_pd.set_index("start")["count"])
 
-summary_text = st.session_state.get("summary_text", "Waiting for a summary...")
-
-with st.container():
-    st.markdown("### Live summary")
-    st.info(summary_text)
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown("### Headlines by source")
-    if by_source_pd.empty:
-        st.write("No source counts available yet.")
-    else:
-        st.bar_chart(by_source_pd.set_index("source"))
-
-with col2:
-    st.markdown("### Trending headline words")
-    if top_words_pd.empty:
-        st.write("No word counts available yet.")
-    else:
-        st.table(top_words_pd)
-
-st.markdown("### Hourly headline volume")
-if by_window_pd.empty:
-    st.write("No window data available yet.")
-else:
-    by_window_pd["start"] = by_window_pd["start"].astype(str)
-    st.line_chart(by_window_pd.rename(columns={"start": "timestamp"}).set_index("timestamp")["count"])
+    time.sleep(5)

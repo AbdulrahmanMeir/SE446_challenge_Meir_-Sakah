@@ -16,6 +16,19 @@ pip install -r requirements.txt
 mkdir -p data/incoming
 ```
 
+On Windows, if Spark reports native Hadoop access errors, install `winutils.exe` and set `HADOOP_HOME`:
+
+- Download `winutils.exe` for Hadoop 3.x
+- Place it in `C:\hadoop\bin\winutils.exe`
+- Set the environment variables in PowerShell:
+
+```powershell
+setx HADOOP_HOME "C:\hadoop"
+setx PATH "%PATH%;C:\hadoop\bin"
+```
+
+3. (Optional) If you want LLM summaries, create an OpenAI key and set `OPENAI_API_KEY` before running Streamlit.
+
 ## Run the pipeline
 
 Open three terminals:
@@ -24,7 +37,18 @@ Open three terminals:
 - Terminal 2: `python streaming_job.py`
 - Terminal 3: `streamlit run app.py`
 
-If you want LLM summaries, set `OPENAI_API_KEY` in your environment before starting the dashboard.
+If you want LLM summaries, set `OPENAI_API_KEY` in your environment before starting the dashboard. If the key is missing, the app still works and shows a keyword-based fallback summary.
+
+## Expected outputs
+
+- `ingester.py` writes JSON-lines files into `data/incoming/` with `source`, `title`, `url`, and `ts` fields.
+- `streaming_job.py` builds three live memory tables: `by_source`, `by_window`, and `top_words`.
+- `app.py` displays:
+  - a bar chart of headline counts by source,
+  - a line chart of hourly headline volume,
+  - a table of top headline words,
+  - a live summary text panel.
+- If the dashboard loads before data arrives, it shows a friendly waiting message instead of an error.
 
 ## Pipeline explanation
 
