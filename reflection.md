@@ -1,0 +1,1 @@
+If the pipeline grew 1000×, the first bottleneck would be the local in-memory streaming aggregation and file ingest on one laptop. To fix it, I would reach for Spark Structured Streaming with durable checkpointing and a scalable sink such as Delta Lake or Kafka so stateful counts can scale beyond a single machine.
